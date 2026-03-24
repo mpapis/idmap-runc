@@ -1,0 +1,172 @@
+#!/bin/bash
+# shellcheck shell=bash
+# /usr/local/bin/idmap-runc
+# OCI runtime wrapper that injects idmap on bind mounts from /home
+#
+# Follows the NVIDIA container runtime pattern:
+# - Intercept "create" subcommand
+# - Modify config.json to add uidMappings/gidMappings on bind mounts
+# - Exec real runc with identical arguments
+#
+# UID/GID are auto-detected from the mount source owner via stat().
+# This makes it work for any user without hardcoding UIDs.
+#
+# WARNING: Untested with gosu, su-exec, or other in-container privilege
+# dropping tools. The bidirectional UID swap means UID 0 and the host UID
+# are exchanged — software that drops from root to a specific UID may end
+# up with unexpected file ownership. Set IDMAP_SKIP=true to opt out.
+#
+# KNOWN LIMITATION: Symlink resolution (readlink -f) is subject to a TOCTOU
+# race — an attacker with write access to the mount source parent directory
+# could swap a symlink between our check and runc's actual mount. The window
+# is very small and requires host-level access.
+
+set -euo pipefail
+
+REAL_RUNC=/usr/bin/runc
+LOG_FILE=/var/log/idmap-runc.log
+# Bind mounts whose source starts with any of these prefixes get idmap injection.
+# Default: any path under /home — works for all users automatically.
+IDMAP_PREFIXES=("/home")
+
+# Only intercept "create"/"run" subcommands — pass everything else through
+SUBCOMMAND=""
+BUNDLE=""
+ARGS=("$@")
+
+for i in "${!ARGS[@]}"; do
+  case "${ARGS[$i]}" in
+    create|run)  # Docker uses "create"; "run" included for manual runc invocations
+      SUBCOMMAND="${ARGS[$i]}"
+      ;;
+    --bundle=*)
+      BUNDLE="${ARGS[$i]#*=}"
+      ;;
+    --bundle|-b)  # containerd uses --bundle; -b for manual runc invocations
+      if [[ $((i + 1)) -lt ${#ARGS[@]} ]]; then
+        BUNDLE="${ARGS[$((i + 1))]}"
+      fi
+      ;;
+  esac
+done
+
+log() {
+  if [[ ! -f "$LOG_FILE" ]]; then
+    { touch "$LOG_FILE" && chmod 640 "$LOG_FILE" && chgrp docker "$LOG_FILE"; } 2>/dev/null || true
+  fi
+  echo "$(date -Iseconds) idmap-runc: $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+inject_idmap() {
+  [[ "$SUBCOMMAND" == "create" || "$SUBCOMMAND" == "run" ]] || return 0
+  [[ -n "$BUNDLE" && -f "$BUNDLE/config.json" ]] || return 0
+
+  log "Intercepted '$SUBCOMMAND' with bundle=$BUNDLE"
+
+  # Read config once to avoid TOCTOU races between checks and modification
+  local CONFIG
+  CONFIG=$(cat "$BUNDLE/config.json") || { log "ERROR: cannot read $BUNDLE/config.json"; return 0; }
+
+  # Safety check 1: Only apply idmap when container runs as root (UID 0)
+  local CONTAINER_UID
+  CONTAINER_UID=$(printf '%s' "$CONFIG" | jq -r '.process.user.uid // 0' 2>/dev/null)
+  if [[ "$CONTAINER_UID" != "0" ]]; then
+    log "Container UID is $CONTAINER_UID (non-root), skipping idmap injection"
+    return 0
+  fi
+
+  # Safety check 2: Allow opt-out via IDMAP_SKIP=true environment variable
+  local IDMAP_SKIP_VAL
+  IDMAP_SKIP_VAL=$(printf '%s' "$CONFIG" | jq -r '[.process.env[]? | select(startswith("IDMAP_SKIP=")) | split("=")[1]] | first // empty' 2>/dev/null)
+  if [[ "${IDMAP_SKIP_VAL,,}" == "true" || "$IDMAP_SKIP_VAL" == "1" ]]; then
+    log "IDMAP_SKIP=true found in container env, skipping idmap injection"
+    return 0
+  fi
+
+  # Build prefix array as JSON for safe jq interpolation (no string injection)
+  local PREFIX_JSON
+  PREFIX_JSON=$(printf '%s\n' "${IDMAP_PREFIXES[@]}" | jq -R . | jq -s .)
+
+  # Find matching bind mount sources using --argjson (safe interpolation)
+  local SOURCES
+  SOURCES=$(printf '%s' "$CONFIG" | jq -r --argjson prefixes "$PREFIX_JSON" '
+    .mounts[] |
+    select(.source as $s | $prefixes | any(. as $p | $s | startswith($p))) |
+    select(.options | any(. == "rbind" or . == "bind")) |
+    select(.options | any(. == "idmap") | not) |
+    .source' 2>/dev/null)
+
+  [[ -z "$SOURCES" ]] && return 0
+
+  # Build owner map: {"/path": {"uid": N, "gid": N}, ...}
+  local OWNER_MAP="{}"
+  local MODIFIED=()
+  local SRC RESOLVED HOST_UID HOST_GID MATCH prefix
+  while IFS= read -r SRC; do
+    [[ -z "$SRC" ]] && continue
+
+    # Resolve symlinks to prevent prefix-check bypass via symlinked paths
+    RESOLVED=$(readlink -f "$SRC" 2>/dev/null) || continue
+    MATCH=false
+    for prefix in "${IDMAP_PREFIXES[@]}"; do
+      [[ "$RESOLVED" == "$prefix"* ]] && MATCH=true && break
+    done
+    if [[ "$MATCH" != "true" ]]; then
+      log "Source $SRC resolves to $RESOLVED (outside allowed prefixes), skipping"
+      continue
+    fi
+
+    HOST_UID=$(stat -c '%u' "$RESOLVED" 2>/dev/null) || continue
+    HOST_GID=$(stat -c '%g' "$RESOLVED" 2>/dev/null) || continue
+
+    # Note: UIDs between 1 and host_uid-1 (and above host_uid) are unmapped.
+    # Processes running as those UIDs will get EOVERFLOW on idmapped mounts.
+    if [[ "$HOST_UID" == "0" || "$HOST_GID" == "0" ]]; then
+      log "Source $SRC (resolved: $RESOLVED) owned by $HOST_UID:$HOST_GID (root UID or GID), skipping"
+      continue
+    fi
+
+    log "Source $SRC (resolved: $RESOLVED) owned by $HOST_UID:$HOST_GID, injecting idmap swap"
+    OWNER_MAP=$(printf '%s' "$OWNER_MAP" | jq \
+      --arg src "$SRC" \
+      --argjson uid "$HOST_UID" \
+      --argjson gid "$HOST_GID" \
+      '. + {($src): {uid: $uid, gid: $gid}}')
+    MODIFIED+=("$SRC")
+  done <<< "$SOURCES"
+
+  if [[ ${#MODIFIED[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  # Single jq pass to inject all mappings atomically
+  local OLD_UMASK
+  OLD_UMASK=$(umask)
+  umask 077
+  if printf '%s' "$CONFIG" | jq --argjson owners "$OWNER_MAP" '
+    .mounts |= [.[] |
+      if $owners[.source] then
+        .options += ["idmap"] |
+        .uidMappings = [
+          {"containerID": 0, "hostID": $owners[.source].uid, "size": 1},
+          {"containerID": $owners[.source].uid, "hostID": 0, "size": 1}
+        ] |
+        .gidMappings = [
+          {"containerID": 0, "hostID": $owners[.source].gid, "size": 1},
+          {"containerID": $owners[.source].gid, "hostID": 0, "size": 1}
+        ]
+      else .
+      end
+    ]' > "$BUNDLE/config.json.tmp" 2>>"$LOG_FILE"; then
+    mv "$BUNDLE/config.json.tmp" "$BUNDLE/config.json"
+    log "Injected idmap mappings for: ${MODIFIED[*]}"
+  else
+    log "ERROR: jq modification failed, preserving original config.json"
+    rm -f "$BUNDLE/config.json.tmp"
+  fi
+  umask "$OLD_UMASK"
+}
+
+inject_idmap
+
+exec -- "$REAL_RUNC" "$@"

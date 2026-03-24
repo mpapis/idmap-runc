@@ -1,0 +1,5 @@
+.idea/
+.claude/
+*.swp
+*~
+.DS_Store

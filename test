@@ -1,0 +1,124 @@
+#!/bin/bash
+# shellcheck shell=bash
+# Integration tests for idmap-runc
+# Requires: idmap-runc registered as a Docker runtime
+#
+# Usage: ./test [--runtime=idmap-runc]
+# Default runtime: idmap-runc
+
+# -e intentionally omitted: tests must continue after individual failures
+set -uo pipefail
+
+RUNTIME="${1:---runtime=idmap-runc}"
+if [[ ! "$RUNTIME" =~ ^--runtime= ]]; then
+  echo "Usage: ./test [--runtime=<name>]"
+  exit 1
+fi
+RUNTIME_FLAG="$RUNTIME"
+TEST_DIR="$(cd "$(dirname "$0")" && pwd)"
+PASS=0
+FAIL=0
+
+red()   { printf '\033[0;31m%s\033[0m\n' "$*"; }
+green() { printf '\033[0;32m%s\033[0m\n' "$*"; }
+
+assert_eq() {
+  local label="$1" expected="$2" actual="$3"
+  if [[ "$expected" == "$actual" ]]; then
+    green "PASS: $label"
+    PASS=$((PASS + 1))
+  else
+    red  "FAIL: $label (expected='$expected', actual='$actual')"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# shellcheck disable=SC2317 # called via trap
+cleanup() {
+  rm -rf "$TEST_DIR"/test-*
+  rm -rf /tmp/idmap-test-outside
+}
+trap cleanup EXIT
+
+HOST_USER="$(id -un)"
+HOST_GROUP="$(id -gn)"
+
+echo "=== idmap-runc integration tests ==="
+echo "Runtime: $RUNTIME_FLAG"
+echo "Test dir: $TEST_DIR"
+echo "Host user: $HOST_USER ($(id -u):$(id -g))"
+echo
+
+# --- Test 1: Container creates file, host sees correct ownership ---
+echo "--- Test 1: Container-created file owned by host user ---"
+docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" alpine \
+  sh -c 'touch /app/test-create && echo "content" > /app/test-create'
+OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-create")"
+assert_eq "container-created file ownership" "$HOST_USER:$HOST_GROUP" "$OWNER"
+
+# --- Test 2: Container sees file as root inside ---
+echo "--- Test 2: Container sees its own file as root ---"
+INNER="$(docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" alpine \
+  stat -c '%u:%g' /app/test-create)"
+assert_eq "container sees root ownership" "0:0" "$INNER"
+
+# --- Test 3: Host-created file seen as root in container ---
+echo "--- Test 3: Host-created file seen as root in container ---"
+echo "host content" > "$TEST_DIR/test-host"
+INNER="$(docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" alpine \
+  stat -c '%u:%g' /app/test-host)"
+assert_eq "host file seen as root in container" "0:0" "$INNER"
+
+# --- Test 4: Container can append to host-created file ---
+echo "--- Test 4: Container appends to host file, ownership preserved ---"
+docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" alpine \
+  sh -c 'echo "appended" >> /app/test-host'
+OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-host")"
+CONTENT="$(tail -1 "$TEST_DIR/test-host")"
+assert_eq "host file ownership after append" "$HOST_USER:$HOST_GROUP" "$OWNER"
+assert_eq "appended content" "appended" "$CONTENT"
+
+# --- Test 5a: Docker volume (non-bind) is NOT affected ---
+echo "--- Test 5a: Docker volume unaffected ---"
+INNER_OWNER="$(docker run "$RUNTIME_FLAG" --rm -v test-idmap-vol:/data alpine \
+  sh -c 'touch /data/test-nomap && stat -c "%u:%g" /data/test-nomap')"
+assert_eq "volume file stays root inside container" "0:0" "$INNER_OWNER"
+docker volume rm test-idmap-vol >/dev/null 2>&1
+
+# --- Test 5b: Bind mount outside /home is NOT affected ---
+# NOTE: Assumes /tmp is not under /home (standard on most Linux distros)
+echo "--- Test 5b: Bind mount outside /home unaffected ---"
+# shellcheck disable=SC2174  # /tmp always exists; -m applies to leaf dir only
+mkdir -p -m 777 /tmp/idmap-test-outside
+docker run "$RUNTIME_FLAG" --rm -v /tmp/idmap-test-outside:/data:z alpine \
+  sh -c 'touch /data/test-nomap'
+OUTER_OWNER="$(stat -c '%u:%g' /tmp/idmap-test-outside/test-nomap)"
+assert_eq "file from non-home bind mount owned by root" "0:0" "$OUTER_OWNER"
+
+# --- Test 6: IDMAP_SKIP=true opt-out ---
+echo "--- Test 6: IDMAP_SKIP=true skips remapping ---"
+docker run "$RUNTIME_FLAG" --rm -e IDMAP_SKIP=true -v "$TEST_DIR:/app" alpine \
+  sh -c 'touch /app/test-skip'
+OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-skip")"
+assert_eq "IDMAP_SKIP creates root-owned file" "root:root" "$OWNER"
+
+# --- Test 7: Non-root container is not remapped ---
+echo "--- Test 7: Non-root container (--user) not remapped ---"
+docker run "$RUNTIME_FLAG" --rm --user "$(id -u):$(id -g)" -v "$TEST_DIR:/app" alpine \
+  sh -c 'touch /app/test-nonroot'
+OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-nonroot")"
+assert_eq "non-root container file ownership" "$HOST_USER:$HOST_GROUP" "$OWNER"
+
+# --- Test 8: Subdirectory creation ---
+echo "--- Test 8: Container creates subdirectory ---"
+docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" alpine \
+  sh -c 'mkdir -p /app/test-subdir && touch /app/test-subdir/nested'
+DIR_OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-subdir")"
+FILE_OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-subdir/nested")"
+assert_eq "subdirectory ownership" "$HOST_USER:$HOST_GROUP" "$DIR_OWNER"
+assert_eq "nested file ownership" "$HOST_USER:$HOST_GROUP" "$FILE_OWNER"
+
+# --- Summary ---
+echo
+echo "=== Results: $PASS passed, $FAIL failed ==="
+exit $((FAIL > 0 ? 1 : 0))

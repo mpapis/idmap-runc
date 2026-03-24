@@ -1,0 +1,245 @@
+#!/bin/bash
+# shellcheck shell=bash
+# Install idmap-runc as a Docker OCI runtime
+#
+# Usage: sudo ./install [--no-default] [--no-recreate]
+#        sudo ./install --uninstall
+#   --no-default   Register runtime but don't make it the default
+#   --no-recreate  Show running containers instead of recreating them
+#   --uninstall    Remove idmap-runc and clean up daemon.json
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_PATH="/usr/local/bin/idmap-runc"
+LOG_FILE="/var/log/idmap-runc.log"
+DAEMON_JSON="/etc/docker/daemon.json"
+RUNC_PATH="${RUNC_PATH:-$(command -v runc 2>/dev/null || echo /usr/bin/runc)}"
+MAKE_DEFAULT=true
+RECREATE=true
+UNINSTALL=false
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-default) MAKE_DEFAULT=false ;;
+    --no-recreate) RECREATE=false ;;
+    --uninstall) UNINSTALL=true ;;
+    *) echo "Unknown option: $arg"; echo "Usage: sudo ./install [--no-default] [--no-recreate] [--uninstall]"; exit 1 ;;
+  esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Error: This script must be run as root (sudo ./install)"
+  exit 1
+fi
+
+# --- Uninstall ---
+if [[ "$UNINSTALL" == "true" ]]; then
+  echo "Uninstalling idmap-runc..."
+
+  if [[ -f "$INSTALL_PATH" ]]; then
+    rm -f "$INSTALL_PATH"
+    echo "  Removed $INSTALL_PATH"
+  else
+    echo "  $INSTALL_PATH not found (already removed?)"
+  fi
+
+  if [[ -f "$DAEMON_JSON" ]]; then
+    EXISTING=$(cat "$DAEMON_JSON")
+    if printf '%s' "$EXISTING" | jq -e '.runtimes["idmap-runc"]' >/dev/null 2>&1; then
+      cp "$DAEMON_JSON" "$DAEMON_JSON.bak.$(date +%s)"
+      UPDATED=$(printf '%s' "$EXISTING" | jq '
+        del(.runtimes["idmap-runc"]) |
+        if .["default-runtime"] == "idmap-runc" then del(.["default-runtime"]) else . end |
+        if .runtimes == {} then del(.runtimes) else . end')
+      printf '%s\n' "$UPDATED" > "$DAEMON_JSON.tmp"
+      mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+      echo "  Cleaned $DAEMON_JSON (backed up original)"
+    else
+      echo "  idmap-runc not found in $DAEMON_JSON"
+    fi
+  fi
+
+  if [[ -f /etc/logrotate.d/idmap-runc ]]; then
+    rm -f /etc/logrotate.d/idmap-runc
+    echo "  Removed logrotate config"
+  fi
+
+  echo "  Log file $LOG_FILE preserved (remove manually if desired)"
+  if systemctl is-active --quiet docker; then
+    echo "Restarting Docker..."
+    systemctl restart docker
+  else
+    echo "Docker is not running, skipping restart."
+  fi
+  echo "Done. idmap-runc has been removed."
+  exit 0
+fi
+
+# --- Preflight checks ---
+echo "Checking requirements..."
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "Error: jq is required but not installed"
+  exit 1
+fi
+
+KERNEL_VERSION=$(uname -r)
+KERNEL_MAJOR=${KERNEL_VERSION%%.*}
+KERNEL_MINOR=${KERNEL_VERSION#*.}
+KERNEL_MINOR=${KERNEL_MINOR%%[.-]*}
+if [[ "$KERNEL_MAJOR" -lt 5 ]] || [[ "$KERNEL_MAJOR" -eq 5 && "$KERNEL_MINOR" -lt 12 ]]; then
+  echo "Error: Kernel 5.12+ required for mount_setattr MOUNT_ATTR_IDMAP (found $KERNEL_VERSION)"
+  exit 1
+fi
+
+if [[ ! -x "$RUNC_PATH" ]]; then
+  echo "Error: runc not found at $RUNC_PATH"
+  exit 1
+fi
+RUNC_PATH=$(readlink -f "$RUNC_PATH")
+if [[ ! "$RUNC_PATH" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+  echo "Error: RUNC_PATH contains invalid characters: $RUNC_PATH"
+  exit 1
+fi
+RUNC_VERSION=$("$RUNC_PATH" --version | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0")
+RUNC_MAJOR=${RUNC_VERSION%%.*}
+RUNC_MINOR=${RUNC_VERSION#*.}
+RUNC_MINOR=${RUNC_MINOR%%.*}
+if [[ "$RUNC_MAJOR" -lt 1 ]] || [[ "$RUNC_MAJOR" -eq 1 && "$RUNC_MINOR" -lt 2 ]]; then
+  echo "Error: runc 1.2.0+ required for OCI mount-level mappings (found $RUNC_VERSION)"
+  exit 1
+fi
+
+echo "  Kernel: $KERNEL_VERSION (>= 5.12)"
+echo "  runc:   $RUNC_VERSION (>= 1.2.0)"
+echo "  jq:     $(jq --version)"
+echo
+
+# 1. Install the wrapper (embed discovered runc path)
+echo "Installing idmap-runc to $INSTALL_PATH..."
+cp "$SCRIPT_DIR/idmap-runc" "$INSTALL_PATH"
+sed -i "s|^REAL_RUNC=.*|REAL_RUNC=$RUNC_PATH|" "$INSTALL_PATH"
+chmod +x "$INSTALL_PATH"
+if ! grep -q "^REAL_RUNC=$RUNC_PATH$" "$INSTALL_PATH"; then
+  echo "Error: Failed to embed runc path into $INSTALL_PATH"
+  exit 1
+fi
+
+# 2. Create log file (root-owned, readable by docker group only)
+if [[ ! -f "$LOG_FILE" ]]; then
+  echo "Creating log file $LOG_FILE..."
+  touch "$LOG_FILE"
+  chmod 640 "$LOG_FILE"
+  chgrp docker "$LOG_FILE"
+fi
+
+# 2b. Install logrotate config
+if [[ -d /etc/logrotate.d ]]; then
+  echo "Installing logrotate config..."
+  cat > /etc/logrotate.d/idmap-runc <<'LOGROTATE'
+/var/log/idmap-runc.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    create 640 root docker
+}
+LOGROTATE
+fi
+
+# 3. Register as Docker runtime
+echo "Updating $DAEMON_JSON..."
+RUNTIME_ENTRY='{"path": "/usr/local/bin/idmap-runc"}'
+
+if [[ -f "$DAEMON_JSON" ]]; then
+  EXISTING=$(cat "$DAEMON_JSON")
+  if ! printf '%s' "$EXISTING" | jq empty 2>/dev/null; then
+    echo "Error: Existing $DAEMON_JSON is not valid JSON, aborting"
+    exit 1
+  fi
+  cp "$DAEMON_JSON" "$DAEMON_JSON.bak.$(date +%s)"
+  echo "  Backed up existing $DAEMON_JSON"
+else
+  EXISTING="{}"
+fi
+
+if [[ "$MAKE_DEFAULT" == "true" ]]; then
+  UPDATED=$(printf '%s' "$EXISTING" | jq \
+    --argjson rt "$RUNTIME_ENTRY" \
+    '.runtimes["idmap-runc"] = $rt | .["default-runtime"] = "idmap-runc"')
+else
+  UPDATED=$(printf '%s' "$EXISTING" | jq \
+    --argjson rt "$RUNTIME_ENTRY" \
+    '.runtimes["idmap-runc"] = $rt')
+fi
+
+if ! printf '%s' "$UPDATED" | jq empty 2>/dev/null; then
+  echo "Error: Generated invalid daemon.json, aborting"
+  exit 1
+fi
+
+printf '%s\n' "$UPDATED" > "$DAEMON_JSON.tmp"
+mv "$DAEMON_JSON.tmp" "$DAEMON_JSON"
+
+# 4. Check if Docker is running, snapshot containers, and restart
+if systemctl is-active --quiet docker; then
+  # Snapshot running containers BEFORE restart (some won't survive without restart policy)
+  COMPOSE_PROJECTS=$(docker ps --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u | grep -v '^$' || true)
+  STANDALONE=$(docker ps --format '{{.ID}} {{.Names}}' --filter 'label!=com.docker.compose.project' 2>/dev/null || true)
+
+  # 5. Restart Docker
+  echo "Restarting Docker..."
+  systemctl restart docker
+else
+  COMPOSE_PROJECTS=""
+  STANDALONE=""
+  echo "Docker is not running, skipping restart. Start Docker and recreate containers to apply."
+fi
+
+echo
+
+# 6. Recreate containers so they pick up the new runtime
+# Docker does not re-run "runc create" on daemon restart — existing containers
+# keep their old config.json. Only recreation applies the idmap wrapper.
+# Containers without a restart policy won't survive the daemon restart,
+# so we use the snapshot taken before restart.
+
+if [[ -n "$COMPOSE_PROJECTS" || -n "$STANDALONE" ]]; then
+  echo "Existing containers must be recreated to use idmap-runc."
+  echo "(Docker daemon restart alone does not recreate containers.)"
+  echo
+
+  if [[ -n "$COMPOSE_PROJECTS" ]]; then
+    if [[ "$RECREATE" == "true" ]]; then
+      echo "Recreating Compose projects..."
+      while IFS= read -r project_dir; do
+        [[ -z "$project_dir" ]] && continue
+        if [[ ! -d "$project_dir" ]]; then
+          echo "  -> $project_dir (directory missing, skipping)"
+          continue
+        fi
+        echo "  -> $project_dir"
+        (cd "$project_dir" && docker compose up --force-recreate -d 2>&1 | sed 's/^/     /') || echo "  WARNING: failed to recreate, run manually: cd $project_dir && docker compose up --force-recreate -d"
+      done <<< "$COMPOSE_PROJECTS"
+    else
+      echo "Compose projects (recreate with: cd <dir> && docker compose up --force-recreate -d):"
+      echo "  ${COMPOSE_PROJECTS//$'\n'/$'\n'  }"
+    fi
+  fi
+
+  if [[ -n "$STANDALONE" ]]; then
+    echo
+    echo "Standalone containers (recreate manually):"
+    echo "  ${STANDALONE//$'\n'/$'\n'  }"
+  fi
+  echo
+fi
+
+if [[ "$MAKE_DEFAULT" == "true" ]]; then
+  echo "Done. idmap-runc is now the default Docker runtime."
+else
+  echo "Done. Use --runtime=idmap-runc to test:"
+  echo "  docker run --runtime=idmap-runc --rm -v ~/projects/test:/app alpine touch /app/test-file"
+fi
