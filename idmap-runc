@@ -11,6 +11,14 @@
 # UID/GID are auto-detected from the mount source owner via stat().
 # This makes it work for any user without hardcoding UIDs.
 #
+# Docker named volumes (sources under /var/lib/docker/volumes/) that are
+# mounted into a container which ALSO has a /home bind mount inherit the
+# same idmap mapping. This prevents asymmetric UID views inside the
+# container — e.g. pnpm writing to /app (idmapped) and /app/node_modules
+# (a named volume, formerly not idmapped) would otherwise see inconsistent
+# ownership and crash. Inheritance is skipped when /home mounts disagree
+# on owner UID/GID.
+#
 # WARNING: Untested with gosu, su-exec, or other in-container privilege
 # dropping tools. The bidirectional UID swap means UID 0 and the host UID
 # are exchanged — software that drops from root to a specific UID may end
@@ -28,6 +36,8 @@ LOG_FILE=/var/log/idmap-runc.log
 # Bind mounts whose source starts with any of these prefixes get idmap injection.
 # Default: any path under /home — works for all users automatically.
 IDMAP_PREFIXES=("/home")
+# Docker named volumes live under this prefix; they inherit idmap from /home mounts.
+DOCKER_VOLUME_PREFIX="/var/lib/docker/volumes/"
 
 # Only intercept "create"/"run" subcommands — pass everything else through
 SUBCOMMAND=""
@@ -87,7 +97,7 @@ inject_idmap() {
   local PREFIX_JSON
   PREFIX_JSON=$(printf '%s\n' "${IDMAP_PREFIXES[@]}" | jq -R . | jq -s .)
 
-  # Find matching bind mount sources using --argjson (safe interpolation)
+  # First pass: find matching bind mount sources under IDMAP_PREFIXES (/home)
   local SOURCES
   SOURCES=$(printf '%s' "$CONFIG" | jq -r --argjson prefixes "$PREFIX_JSON" '
     .mounts[] |
@@ -96,11 +106,11 @@ inject_idmap() {
     select(.options | any(. == "idmap") | not) |
     .source' 2>/dev/null)
 
-  [[ -z "$SOURCES" ]] && return 0
-
   # Build owner map: {"/path": {"uid": N, "gid": N}, ...}
   local OWNER_MAP="{}"
   local MODIFIED=()
+  local PRIMARY_UID=""
+  local PRIMARY_GID=""
   local SRC RESOLVED HOST_UID HOST_GID MATCH prefix
   while IFS= read -r SRC; do
     [[ -z "$SRC" ]] && continue
@@ -133,7 +143,39 @@ inject_idmap() {
       --argjson gid "$HOST_GID" \
       '. + {($src): {uid: $uid, gid: $gid}}')
     MODIFIED+=("$SRC")
+
+    # Track the mapping for inheriting onto docker named volumes
+    if [[ -z "$PRIMARY_UID" ]]; then
+      PRIMARY_UID="$HOST_UID"
+      PRIMARY_GID="$HOST_GID"
+    elif [[ "$PRIMARY_UID" != "CONFLICT" && ( "$PRIMARY_UID" != "$HOST_UID" || "$PRIMARY_GID" != "$HOST_GID" ) ]]; then
+      log "WARN: /home mounts have conflicting owners (${PRIMARY_UID}:${PRIMARY_GID} vs ${HOST_UID}:${HOST_GID}); docker volume inheritance disabled"
+      PRIMARY_UID="CONFLICT"
+    fi
   done <<< "$SOURCES"
+
+  # Second pass: docker named volumes inherit the /home mapping (if unambiguous).
+  # Skipped if no /home mount was idmapped or if /home mounts disagreed.
+  if [[ -n "$PRIMARY_UID" && "$PRIMARY_UID" != "CONFLICT" ]]; then
+    local VOLUME_SOURCES
+    VOLUME_SOURCES=$(printf '%s' "$CONFIG" | jq -r --arg pfx "$DOCKER_VOLUME_PREFIX" '
+      .mounts[] |
+      select(.source | startswith($pfx)) |
+      select(.options | any(. == "rbind" or . == "bind")) |
+      select(.options | any(. == "idmap") | not) |
+      .source' 2>/dev/null)
+
+    while IFS= read -r SRC; do
+      [[ -z "$SRC" ]] && continue
+      log "Docker named volume $SRC inheriting idmap ${PRIMARY_UID}:${PRIMARY_GID} from /home mount"
+      OWNER_MAP=$(printf '%s' "$OWNER_MAP" | jq \
+        --arg src "$SRC" \
+        --argjson uid "$PRIMARY_UID" \
+        --argjson gid "$PRIMARY_GID" \
+        '. + {($src): {uid: $uid, gid: $gid}}')
+      MODIFIED+=("$SRC")
+    done <<< "$VOLUME_SOURCES"
+  fi
 
   if [[ ${#MODIFIED[@]} -eq 0 ]]; then
     return 0
