@@ -61,6 +61,19 @@ The wrapper injects two mapping entries per mount — a **swap** between contain
 
 > **Note:** When a mount entry has `uidMappings`/`gidMappings`, runc creates a temporary throwaway user namespace to apply `mount_setattr(MOUNT_ATTR_IDMAP)`, then passes the mapped mount fd to the container. The container itself does **not** need to be in a user namespace.
 
+### Named Volume Inheritance
+
+When a container mounts **both** a `/home` bind mount and a Docker named volume (source under `/var/lib/docker/volumes/`), the named volume inherits the same UID/GID swap as the `/home` mount.
+
+This is needed because container tools that write across both paths — e.g. `pnpm install` reading `package.json` from a bind-mounted project and writing into a `node_modules` named volume — break when the two paths report different UIDs. Without inheritance, `/app` would appear root-owned (via idmap) while `/app/node_modules` would appear under whatever raw UID Docker created the volume with, and the tool would fail (in pnpm's case, mid-install with SIGKILL).
+
+Inheritance only kicks in when:
+
+- The container has at least one `/home` bind mount that received idmap injection
+- All `/home` mounts agree on the owner UID/GID (mixed-owner containers log a warning and disable inheritance)
+
+Containers that mount only named volumes (no `/home` bind mount) are unaffected — the wrapper has no UID/GID to inherit from and leaves them alone.
+
 ## Requirements
 
 | Requirement | Minimum | Notes |
@@ -194,7 +207,7 @@ UID/GID are auto-detected from the mount source owner via `stat()` — no config
 ## Safety Checks
 
 1. **Only root containers** — skips idmap when `process.user.uid != 0` (non-root containers already create files as the correct user)
-2. **Only matching bind mounts** — named volumes and mounts from outside configured paths are never touched
+2. **Only matching bind mounts** — bind mounts from outside configured paths are never touched. Named volumes are touched only when the container also has a `/home` bind mount (see *Named Volume Inheritance* above); otherwise they're left alone.
 3. **Opt-out per container** — set `IDMAP_SKIP=true` (also accepts `TRUE`, `True`, `1`):
    ```yaml
    environment:
@@ -233,11 +246,12 @@ The test suite covers:
 | 2 | Container sees own file as root | Bidirectional mapping works — container sees `0:0` |
 | 3 | Host file seen as root in container | Existing host files map to root inside container |
 | 4 | Container appends to host file | Ownership preserved after container writes to host file |
-| 5a | Named volume unaffected | Named volumes (non-bind mounts) are not remapped |
+| 5a | Named volume unaffected (no /home mount) | Named volumes alone are not remapped |
 | 5b | Non-home bind mount unaffected | Bind mounts outside `IDMAP_PREFIXES` are not remapped |
 | 6 | IDMAP_SKIP opt-out | `IDMAP_SKIP=true` env var disables injection |
 | 7 | Non-root container bypass | `--user` containers skip idmap (not needed) |
 | 8 | Subdirectory creation | Directories and nested files get correct ownership |
+| 9 | Named volume inherits /home mapping | When both `/home` bind and a named volume are mounted, volume files are owned by host user |
 
 ## Debugging
 

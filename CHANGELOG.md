@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 — 2026-05-28
+
+- Docker named volumes inherit idmap mapping from `/home` bind mounts in the same container. Fixes a crash mode in dev containers that mount both a project directory (idmapped) and a named volume (e.g. `node_modules`, formerly not idmapped) — the asymmetric UID view between the two paths broke tools like pnpm/npm with SIGKILL mid-install.
+- Inheritance is skipped when `/home` mounts have conflicting owner UID/GID, and when no `/home` mount is present (containers using only named volumes are untouched).
+- New integration test (test 9) exercising the volume-inheritance path.
+
 ## 1.0.0 — 2025-03-24
 
 Initial release.

@@ -118,6 +118,21 @@ FILE_OWNER="$(stat -c '%U:%G' "$TEST_DIR/test-subdir/nested")"
 assert_eq "subdirectory ownership" "$HOST_USER:$HOST_GROUP" "$DIR_OWNER"
 assert_eq "nested file ownership" "$HOST_USER:$HOST_GROUP" "$FILE_OWNER"
 
+# --- Test 9: Named volume inherits idmap when /home bind mount also present ---
+# Counterpart to test 5a — a named volume alone is unaffected, but when a /home
+# bind mount is also mounted, the volume inherits the same UID/GID swap so the
+# container sees consistent ownership across both paths.
+echo "--- Test 9: Named volume inherits /home idmap when both mounted ---"
+docker volume rm test-idmap-inherit >/dev/null 2>&1 || true
+docker run "$RUNTIME_FLAG" --rm -v "$TEST_DIR:/app" -v test-idmap-inherit:/vol alpine \
+  sh -c 'touch /vol/test-inherit'
+# Read back from a container WITHOUT a /home mount so the wrapper applies no
+# idmap and we see raw on-disk UID/GID.
+RAW_OWNER="$(docker run "$RUNTIME_FLAG" --rm -v test-idmap-inherit:/vol alpine \
+  stat -c '%u:%g' /vol/test-inherit)"
+assert_eq "volume file inherits host UID/GID (with /home mount)" "$(id -u):$(id -g)" "$RAW_OWNER"
+docker volume rm test-idmap-inherit >/dev/null 2>&1
+
 # --- Summary ---
 echo
 echo "=== Results: $PASS passed, $FAIL failed ==="
